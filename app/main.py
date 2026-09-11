@@ -1,15 +1,23 @@
 import io
 import random
+from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
 from app.language_detect import detect_language
-from app.tts_engine import synthesize
+from app.tts_engine import synthesize, warm_up
 from app.voices import pick_voice
 
-app = FastAPI()
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    warm_up()
+    yield
+
+
+app = FastAPI(lifespan=lifespan)
 
 
 class TtsRequest(BaseModel):

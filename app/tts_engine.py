@@ -1,4 +1,5 @@
 import io
+import threading
 
 import soundfile as sf
 import torch
@@ -7,13 +8,25 @@ from kokoro import KPipeline
 _LANG_CODES = {"en": "a", "zh": "z"}
 _DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 _pipelines: dict[str, KPipeline] = {}
+_pipeline_lock = threading.Lock()
+
+print(f"Kokoro TTS device: {_DEVICE}", flush=True)
 
 
 def _get_pipeline(language: str) -> KPipeline:
     if language not in _pipelines:
-        lang_code = _LANG_CODES[language]
-        _pipelines[language] = KPipeline(lang_code=lang_code, device=_DEVICE)
+        with _pipeline_lock:
+            if language not in _pipelines:
+                lang_code = _LANG_CODES[language]
+                _pipelines[language] = KPipeline(lang_code=lang_code, device=_DEVICE)
     return _pipelines[language]
+
+
+def warm_up() -> None:
+    """Pre-build every language's pipeline so the first real request doesn't
+    pay KPipeline construction time (~20s+) inside its HTTP timeout budget."""
+    for language in _LANG_CODES:
+        _get_pipeline(language)
 
 
 def synthesize(text: str, voice_id: str, language: str) -> bytes:
