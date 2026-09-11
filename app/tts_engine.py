@@ -20,8 +20,8 @@ def synthesize(text: str, voice_id: str, language: str) -> bytes:
     """Run Kokoro synthesis and return WAV bytes (24kHz mono)."""
     pipeline = _get_pipeline(language)
     audio_chunks = [audio for _, _, audio in pipeline(text, voice=voice_id)]
-    audio = torch.cat(audio_chunks) if len(audio_chunks) > 1 else audio_chunks[0]
+    audio = torch.cat(audio_chunks)
 
     buffer = io.BytesIO()
-    sf.write(buffer, audio.numpy(), samplerate=24000, format="WAV")
+    sf.write(buffer, audio.cpu().numpy(), samplerate=24000, format="WAV")
     return buffer.getvalue()
