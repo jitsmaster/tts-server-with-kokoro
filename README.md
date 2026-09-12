@@ -1,6 +1,6 @@
 # Kokoro TTS Server
 
-Local FastAPI + Kokoro TTS server for English/Chinese, 2 male + 2 female voices
+Local FastAPI + Kokoro TTS server for English/Chinese, 1 male + 1 female voice
 each. Used by Claude Code's PowerShell voice hooks.
 
 ## Setup
@@ -78,5 +78,5 @@ at random. Returns `audio/wav` bytes.
 
 | Language | Male | Female |
 |---|---|---|
-| English | am_adam, am_michael | af_heart, af_bella |
-| Chinese | zm_yunxi, zm_yunjian | zf_xiaobei, zf_xiaoni |
+| English | am_michael | af_bella |
+| Chinese | zm_yunjian | zf_xiaobei |

@@ -38,7 +38,7 @@ def test_chinese_text_with_explicit_gender_picks_zh_pool():
         )
     assert response.status_code == 200
     assert captured["language"] == "zh"
-    assert captured["voice_id"] in ["zm_yunxi", "zm_yunjian"]
+    assert captured["voice_id"] == "zm_yunjian"
 
 
 def test_invalid_gender_falls_back_to_random_choice():
@@ -53,7 +53,7 @@ def test_invalid_gender_falls_back_to_random_choice():
             "/tts", json={"text": "Hello", "voice_gender": "robot"}
         )
     assert response.status_code == 200
-    assert captured["voice_id"] in ["am_adam", "am_michael", "af_heart", "af_bella"]
+    assert captured["voice_id"] in ["am_michael", "af_bella"]
 
 
 def test_synthesis_exception_returns_500():

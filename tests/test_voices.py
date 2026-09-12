@@ -11,7 +11,7 @@ def test_pick_voice_returns_id_from_correct_pool():
 
 
 def test_pick_voice_uses_random_choice():
-    with patch("app.voices.random.choice", return_value="am_adam") as mock_choice:
+    with patch("app.voices.random.choice", return_value="am_michael") as mock_choice:
         result = pick_voice("en", "male")
-        mock_choice.assert_called_once_with(["am_adam", "am_michael"])
-        assert result == "am_adam"
+        mock_choice.assert_called_once_with(["am_michael"])
+        assert result == "am_michael"
