@@ -1,4 +1,4 @@
-if (Test-Path 'C:\Users\awang\.claude\tts-muted.flag') { exit }
+﻿if (Test-Path 'C:\Users\awang\.claude\tts-muted.flag') { exit }
 
 $raw  = [Console]::In.ReadToEnd()
 $data = try { $raw | ConvertFrom-Json } catch { $null }

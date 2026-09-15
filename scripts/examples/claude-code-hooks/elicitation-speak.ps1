@@ -1,4 +1,4 @@
-if (Test-Path 'C:\Users\awang\.claude\tts-muted.flag') { exit }
+﻿if (Test-Path 'C:\Users\awang\.claude\tts-muted.flag') { exit }
 
 $raw  = [Console]::In.ReadToEnd()
 $data = try { $raw | ConvertFrom-Json } catch { $null }
@@ -25,7 +25,7 @@ $msg = $msg -replace '\[([^\]]+)\]\([^)]+\)', '$1'
 $msg = $msg -replace '[—–]',            ' '
 $msg = $msg -replace '\s+-\s+',         ' '
 $msg = $msg -replace '[|~^_]',           ' '
-$msg = $msg -replace '[^\x20-\x7E\r\n一-鿿㐀-䶿豈-﫿]','  '
+$msg = $msg -replace '[^\x20-\x7E\r\n一-鿿㐀-䶿豈-﫿]','  '
 
 . "C:\Users\awang\.claude\skill-lookup.ps1"
 $skillName = Get-CurrentSkillName -TranscriptPath $data.transcript_path
