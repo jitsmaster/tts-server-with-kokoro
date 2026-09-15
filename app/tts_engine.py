@@ -7,6 +7,7 @@ import torch
 from kokoro import KPipeline
 
 _LANG_CODES = {"en": "a", "zh": "z"}
+_SPEED = 1.05
 _DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 _pipelines: dict[str, KPipeline] = {}
 _pipeline_lock = threading.Lock()
@@ -51,7 +52,7 @@ def _synthesize_zh(pipeline: KPipeline, text: str, voice_id: str) -> list[torch.
             continue
         for i in range(0, len(phonemes), 510):
             chunk = phonemes[i:i + 510]
-            for _, _, audio in pipeline.generate_from_tokens(chunk, voice=voice_id):
+            for _, _, audio in pipeline.generate_from_tokens(chunk, voice=voice_id, speed=_SPEED):
                 audio_chunks.append(audio)
     return audio_chunks
 
@@ -63,7 +64,7 @@ def synthesize(text: str, voice_id: str, language: str) -> bytes:
         if language == "zh":
             audio_chunks = _synthesize_zh(pipeline, text, voice_id)
         else:
-            audio_chunks = [audio for _, _, audio in pipeline(text, voice=voice_id)]
+            audio_chunks = [audio for _, _, audio in pipeline(text, voice=voice_id, speed=_SPEED)]
     audio = torch.cat(audio_chunks)
 
     buffer = io.BytesIO()
