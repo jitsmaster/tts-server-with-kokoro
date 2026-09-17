@@ -78,5 +78,5 @@ at random. Returns `audio/wav` bytes.
 
 | Language | Male | Female |
 |---|---|---|
-| English | am_michael | af_bella |
+| English | bm_daniel | bf_isabella |
 | Chinese | zm_yunjian | zf_xiaobei |

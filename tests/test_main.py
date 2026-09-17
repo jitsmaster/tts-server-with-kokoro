@@ -53,7 +53,7 @@ def test_invalid_gender_falls_back_to_random_choice():
             "/tts", json={"text": "Hello", "voice_gender": "robot"}
         )
     assert response.status_code == 200
-    assert captured["voice_id"] in ["am_michael", "af_bella"]
+    assert captured["voice_id"] in ["bm_daniel", "bf_isabella"]
 
 
 def test_synthesis_exception_returns_500():

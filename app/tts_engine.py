@@ -6,8 +6,8 @@ import soundfile as sf
 import torch
 from kokoro import KPipeline
 
-_LANG_CODES = {"en": "a", "zh": "z"}
-_SPEED = 1.1025
+_LANG_CODES = {"en": "b", "zh": "z"}
+_SPEED = 1.0
 _DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 _pipelines: dict[str, KPipeline] = {}
 _pipeline_lock = threading.Lock()

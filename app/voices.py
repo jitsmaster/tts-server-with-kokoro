@@ -1,7 +1,7 @@
 import random
 
 VOICES: dict[str, dict[str, list[str]]] = {
-    "en": {"male": ["am_michael"], "female": ["af_bella"]},
+    "en": {"male": ["bm_daniel"], "female": ["bf_isabella"]},
     "zh": {"male": ["zm_yunjian"], "female": ["zf_xiaobei"]},
 }
 
