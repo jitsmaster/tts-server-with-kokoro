@@ -69,12 +69,32 @@ def _wav_samples(data):
     return len(audio), rate
 
 
-def test_split_sentences_breaks_after_sentence_ends_semicolons_and_colons():
+def test_split_sentences_breaks_after_sentence_ends_and_semicolons_but_not_colons():
     text = "Done on: Session: Voice work; Workspace: dsh-plugins. All merged! 3.5 is fine\nNext line"
     assert tts_engine._split_sentences(text) == [
-        "Done on:", "Session:", "Voice work;", "Workspace:", "dsh-plugins.", "All merged!", "3.5 is fine", "Next line",
+        "Done on: Session: Voice work;", "Workspace: dsh-plugins.", "All merged!", "3.5 is fine", "Next line",
     ]
     assert tts_engine._split_sentences("你好。再见！好；行") == ["你好。", "再见！", "好；", "行"]
+
+
+def test_trim_silence_cuts_the_padding_the_model_leaves_around_a_phrase():
+    pad = torch.zeros(2400)
+    core = torch.ones(1000)
+    trimmed = tts_engine._trim_silence(torch.cat([pad, core, pad]))
+    keep = int(0.05 * 24000)
+    assert len(trimmed) == 1000 + 2 * keep
+    assert len(tts_engine._trim_silence(torch.zeros(500))) == 500  # all silence: left alone
+
+
+def test_paced_sentences_are_trimmed_before_the_silence_is_added():
+    class Padded(_FakePipeline):
+        def __call__(self, text, voice=None, speed=1.0):
+            yield None, None, torch.cat([torch.zeros(4000), torch.ones(100), torch.zeros(4000)])
+
+    keep = int(0.05 * 24000)
+    with patch("app.tts_engine._get_pipeline", return_value=Padded()):
+        data = tts_engine.synthesize("One. Two.", "bm_daniel", "en", pause_s=0.5)
+    assert _wav_samples(data)[0] == 2 * (100 + 2 * keep) + int(0.5 * 24000)
 
 
 def test_without_pause_the_text_goes_in_whole_at_the_default_speed():

@@ -57,14 +57,23 @@ def _synthesize_zh(pipeline: KPipeline, text: str, voice_id: str, speed: float =
     return audio_chunks
 
 
-# A break after a sentence end, semicolon or colon (ASCII ones need a space after them, so "3.5" stays whole),
-# after the same marks in Chinese, or at a newline.
-_SENTENCE_BREAK = re.compile(r"(?:(?<=[.!?;:])\s+|(?<=[。！？；：])\s*|\n+)")
+# A break after a sentence end or semicolon (ASCII ones need a space after them, so "3.5" stays whole),
+# after the same marks in Chinese, or at a newline. Not at colons: "Session: Voice work" stays one phrase.
+_SENTENCE_BREAK = re.compile(r"(?:(?<=[.!?;])\s+|(?<=[。！？；])\s*|\n+)")
 _SAMPLE_RATE = 24000
 
 
 def _split_sentences(text: str) -> list[str]:
     return [part.strip() for part in _SENTENCE_BREAK.split(text) if part and part.strip()]
+
+
+def _trim_silence(audio: torch.Tensor, threshold: float = 0.01, keep_s: float = 0.05) -> torch.Tensor:
+    """Cut the near-silent padding the model leaves around a phrase (keeping a little), so pauses are the ones we add."""
+    loud = (audio.abs() > threshold).nonzero()
+    if loud.numel() == 0:
+        return audio
+    keep = int(keep_s * _SAMPLE_RATE)
+    return audio[max(int(loud[0]) - keep, 0) : int(loud[-1]) + 1 + keep]
 
 
 def _synthesize_paced(pipeline: KPipeline, text: str, voice_id: str, language: str, speed: float, pause_s: float):
@@ -75,9 +84,11 @@ def _synthesize_paced(pipeline: KPipeline, text: str, voice_id: str, language: s
         if chunks:
             chunks.append(silence)
         if language == "zh":
-            chunks.extend(_synthesize_zh(pipeline, sentence, voice_id, speed))
+            parts = _synthesize_zh(pipeline, sentence, voice_id, speed)
         else:
-            chunks.extend(audio for _, _, audio in pipeline(sentence, voice=voice_id, speed=speed))
+            parts = [audio for _, _, audio in pipeline(sentence, voice=voice_id, speed=speed)]
+        if parts:
+            chunks.append(_trim_silence(torch.cat(parts)))
     return chunks
 
 
