@@ -74,6 +74,8 @@ existing and the task will fail at next logon.
 `voice_gender` is optional (`"male"` or `"female"`); if omitted, one is chosen
 at random. Returns `audio/wav` bytes.
 
+Two more optional fields: `speed` (0.5 to 1.5, default 1.0) sets the speaking rate for that request, and `pause_s` (0 to 2) synthesizes sentence by sentence with that many seconds of silence between them (breaks after `. ! ? ; :` and the Chinese equivalents, and at newlines).
+
 ## Voices
 
 | Language | Male | Female |

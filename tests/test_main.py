@@ -63,3 +63,22 @@ def test_synthesis_exception_returns_500():
     with patch("app.main.synthesize", side_effect=raise_error):
         response = client.post("/tts", json={"text": "Hello"})
     assert response.status_code == 500
+
+
+def test_speed_and_pause_are_forwarded_only_when_given():
+    seen = {}
+
+    def capture(text, voice_id, language, **kwargs):
+        seen.update(kwargs)
+        return b"fake"
+
+    with patch("app.main.synthesize", side_effect=capture):
+        assert client.post("/tts", json={"text": "Hello. There."}).status_code == 200
+        assert seen == {}
+        assert client.post("/tts", json={"text": "Hello. There.", "speed": 0.85, "pause_s": 0.4}).status_code == 200
+    assert seen == {"speed": 0.85, "pause_s": 0.4}
+
+
+def test_speed_and_pause_outside_their_range_are_rejected():
+    for body in ({"speed": 0.1}, {"speed": 3}, {"pause_s": -1}, {"pause_s": 5}):
+        assert client.post("/tts", json={"text": "Hello", **body}).status_code == 422

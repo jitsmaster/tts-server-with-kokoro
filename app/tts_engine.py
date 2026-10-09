@@ -35,7 +35,7 @@ def warm_up() -> None:
         _get_pipeline(language)
 
 
-def _synthesize_zh(pipeline: KPipeline, text: str, voice_id: str) -> list[torch.Tensor]:
+def _synthesize_zh(pipeline: KPipeline, text: str, voice_id: str, speed: float = _SPEED) -> list[torch.Tensor]:
     """Chinese path: KPipeline.__call__ passes misaki's ZHG2P output (a
     (phonemes, tokens) tuple) straight into KModel as if it were the phoneme
     string itself, so every request ends up with the same fixed-length
@@ -52,21 +52,50 @@ def _synthesize_zh(pipeline: KPipeline, text: str, voice_id: str) -> list[torch.
             continue
         for i in range(0, len(phonemes), 510):
             chunk = phonemes[i:i + 510]
-            for _, _, audio in pipeline.generate_from_tokens(chunk, voice=voice_id, speed=_SPEED):
+            for _, _, audio in pipeline.generate_from_tokens(chunk, voice=voice_id, speed=speed):
                 audio_chunks.append(audio)
     return audio_chunks
 
 
-def synthesize(text: str, voice_id: str, language: str) -> bytes:
-    """Run Kokoro synthesis and return WAV bytes (24kHz mono)."""
-    pipeline = _get_pipeline(language)
-    with _inference_lock:
+# A break after a sentence end, semicolon or colon (ASCII ones need a space after them, so "3.5" stays whole),
+# after the same marks in Chinese, or at a newline.
+_SENTENCE_BREAK = re.compile(r"(?:(?<=[.!?;:])\s+|(?<=[。！？；：])\s*|\n+)")
+_SAMPLE_RATE = 24000
+
+
+def _split_sentences(text: str) -> list[str]:
+    return [part.strip() for part in _SENTENCE_BREAK.split(text) if part and part.strip()]
+
+
+def _synthesize_paced(pipeline: KPipeline, text: str, voice_id: str, language: str, speed: float, pause_s: float):
+    """One synthesis per sentence with pause_s of silence between them, so each phrase is heard apart."""
+    chunks: list[torch.Tensor] = []
+    silence = torch.zeros(int(pause_s * _SAMPLE_RATE))
+    for sentence in _split_sentences(text):
+        if chunks:
+            chunks.append(silence)
         if language == "zh":
-            audio_chunks = _synthesize_zh(pipeline, text, voice_id)
+            chunks.extend(_synthesize_zh(pipeline, sentence, voice_id, speed))
         else:
-            audio_chunks = [audio for _, _, audio in pipeline(text, voice=voice_id, speed=_SPEED)]
+            chunks.extend(audio for _, _, audio in pipeline(sentence, voice=voice_id, speed=speed))
+    return chunks
+
+
+def synthesize(text: str, voice_id: str, language: str, speed: float | None = None, pause_s: float = 0.0) -> bytes:
+    """Run Kokoro synthesis and return WAV bytes (24kHz mono).
+
+    speed overrides the default for this request; pause_s > 0 puts that many seconds of silence between sentences."""
+    pipeline = _get_pipeline(language)
+    speed = speed or _SPEED
+    with _inference_lock:
+        if pause_s and pause_s > 0:
+            audio_chunks = _synthesize_paced(pipeline, text, voice_id, language, speed, pause_s)
+        elif language == "zh":
+            audio_chunks = _synthesize_zh(pipeline, text, voice_id, speed)
+        else:
+            audio_chunks = [audio for _, _, audio in pipeline(text, voice=voice_id, speed=speed)]
     audio = torch.cat(audio_chunks)
 
     buffer = io.BytesIO()
-    sf.write(buffer, audio.cpu().numpy(), samplerate=24000, format="WAV")
+    sf.write(buffer, audio.cpu().numpy(), samplerate=_SAMPLE_RATE, format="WAV")
     return buffer.getvalue()
