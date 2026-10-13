@@ -1,5 +1,9 @@
 $root = Split-Path -Parent $MyInvocation.MyCommand.Path
 $logDir = Join-Path $root 'logs'
+
+# Already serving? Do nothing (a second server would load the model onto the GPU again, then fail to bind).
+if (Get-NetTCPConnection -LocalPort 8880 -State Listen -ErrorAction SilentlyContinue) { exit 0 }
+
 if (-not (Test-Path $logDir)) { New-Item -ItemType Directory -Path $logDir | Out-Null }
 
 Start-Process -FilePath "$root\.venv\Scripts\python.exe" `
