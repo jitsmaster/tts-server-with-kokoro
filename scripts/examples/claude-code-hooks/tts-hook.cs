@@ -21,10 +21,13 @@
 // warm, it builds the text, synthesizes (or hits the WAV cache) and plays, one message at a time
 // (requests stream from the server phrase by phrase and start playing after the first one; one playback
 // thread plays them high-priority-first then FIFO, holding
-// the same cross-process mutex and polling tts-stop.flag as before). If no player is running the
+// the same cross-process mutex and honouring tts-stop.flag as before). If no player is running the
 // client starts it, and if that fails it falls back to a detached one-shot worker.
 // The player does NOT write its PID to audio.pids (Ctrl+Alt+M hard-kills that PID; it must not kill
-// the player); playback stops via tts-stop.flag, polled every 50 ms.
+// the player); playback stops via tts-stop.flag. The player does no per-message file IO that it can avoid:
+// FileSystemWatcher notifications (no polling) keep the config, the mute flag, the stop request and the
+// session names current in memory, recent WAVs and the list of cached WAVs live in memory, the transcript
+// is only read from where the last read stopped, and the log size is counted instead of stat-ed.
 //
 // Build (C# 5 compiler that ships with .NET Framework):
 //   C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe /target:winexe /optimize /out:tts-hook.exe ^
@@ -153,15 +156,20 @@ static class TtsHook
         catch { return false; }
     }
 
+    static Mutex SingleInstance;
+
     static int Daemon()
     {
         // The player outlives whichever project the first hook ran in; never keep that directory locked.
         try { Directory.SetCurrentDirectory(Dir); } catch { }
         bool created;
-        Mutex single = new Mutex(true, "Global\\TtsHookDaemon", out created);
+        // Held in a static field: a local that is never read again is collected (and the named mutex with it)
+        // by the JIT-optimised build, after which tts-send.exe sees "no player" and starts another one.
+        SingleInstance = new Mutex(true, "Global\\TtsHookDaemon", out created);
         if (!created) return 0;                                   // another player is already running
 
-        Log("tts-hook.log", "player started pid=" + Process.GetCurrentProcess().Id);
+        StartWatchers();
+        Log("tts-hook.log", "player started pid=" + Process.GetCurrentProcess().Id + (WatchActive ? "" : " (no file watchers: polling)"));
         try { File.WriteAllText(P("audio.pids"), ""); } catch { }
 
         Thread playback = new Thread(PlayerLoop);
@@ -252,6 +260,110 @@ static class TtsHook
         }
     }
 
+    // ---- in-memory state of the resident player ------------------------------------------------
+    // The player watches ~\.claude\tts-* and ~\.claude\sessions with FileSystemWatcher (change notifications
+    // from the kernel, no polling) so that nothing has to be re-read per message. One-shot workers
+    // (WatchActive == false) keep reading the files directly.
+    static volatile bool WatchActive;
+    static volatile bool Muted, StopRequested, StaleStopFlag, Playing;
+    static readonly ManualResetEvent StopEvent = new ManualResetEvent(false);
+    static readonly object StopLock = new object();
+    static FileSystemWatcher _dirWatch, _sessWatch;
+    static System.Threading.Timer _cfgTimer;
+
+    static void StartWatchers()
+    {
+        try
+        {
+            Muted = File.Exists(P("tts-muted.flag"));
+            ReloadCfg();
+            _cfgTimer = new System.Threading.Timer(delegate (object o) { ReloadCfg(); }, null, Timeout.Infinite, Timeout.Infinite);
+
+            FileSystemWatcher w = new FileSystemWatcher(Dir, "tts-*");
+            w.NotifyFilter = NotifyFilters.FileName | NotifyFilters.LastWrite | NotifyFilters.CreationTime;
+            w.InternalBufferSize = 32768;
+            w.Created += delegate (object o, FileSystemEventArgs e) { OnDirName(e.Name); };
+            w.Changed += delegate (object o, FileSystemEventArgs e) { OnDirName(e.Name); };
+            w.Deleted += delegate (object o, FileSystemEventArgs e) { OnDirName(e.Name); };
+            w.Renamed += delegate (object o, RenamedEventArgs e) { OnDirName(e.Name); OnDirName(e.OldName); };
+            w.Error += delegate (object o, ErrorEventArgs e) { Resync(); };   // event buffer overflowed: re-read everything once
+            w.EnableRaisingEvents = true;
+            _dirWatch = w;
+
+            string sd = P("sessions");
+            if (Directory.Exists(sd))
+            {
+                FileSystemWatcher sw = new FileSystemWatcher(sd, "*.json");
+                sw.NotifyFilter = NotifyFilters.FileName | NotifyFilters.LastWrite;
+                sw.Created += delegate (object o, FileSystemEventArgs e) { SessionsChanged(e.FullPath); };
+                sw.Changed += delegate (object o, FileSystemEventArgs e) { SessionsChanged(e.FullPath); };
+                sw.Deleted += delegate (object o, FileSystemEventArgs e) { SessionsChanged(e.FullPath); };
+                sw.Renamed += delegate (object o, RenamedEventArgs e) { SessionsChanged(e.FullPath); SessionsChanged(e.OldFullPath); };
+                sw.Error += delegate (object o, ErrorEventArgs e) { SessionsChanged(null); };
+                sw.EnableRaisingEvents = true;
+                _sessWatch = sw;
+            }
+            WatchActive = true;
+        }
+        catch (Exception ex)
+        {
+            WatchActive = false;
+            Log("tts-hook-errors.log", "file watchers: " + ex.GetType().Name + ": " + ex.Message);
+        }
+    }
+
+    static void OnDirName(string n)
+    {
+        if (n == "tts-stop.flag") OnStopFlag();
+        else if (n == "tts-muted.flag") Muted = File.Exists(P("tts-muted.flag"));
+        else if (n == "tts-config.json") { System.Threading.Timer t = _cfgTimer; if (t != null) t.Change(150, Timeout.Infinite); }   // debounce editor writes
+    }
+
+    static void Resync()
+    {
+        Muted = File.Exists(P("tts-muted.flag"));
+        ReloadCfg();
+        SessionsChanged(null);
+        OnStopFlag();
+    }
+
+    // The hotkey creates tts-stop.flag. While playing: request a stop and remove the file; while idle: remember
+    // that a stale flag is lying around (deleted when the next playback starts, as before).
+    static void OnStopFlag()
+    {
+        string f = P("tts-stop.flag");
+        bool remove = false;
+        lock (StopLock)
+        {
+            if (!File.Exists(f)) return;                           // our own delete, or a duplicate event
+            if (Playing) { StopRequested = true; StopEvent.Set(); remove = true; }
+            else StaleStopFlag = true;
+        }
+        // The event can arrive while the writer still has the file open: retry the delete for a moment.
+        if (remove)
+            for (int i = 0; i < 8; i++)
+            {
+                try { File.Delete(f); return; }
+                catch { Thread.Sleep(25); }
+            }
+    }
+    static void BeginPlayback(string stopFlag)
+    {
+        if (!WatchActive) { try { File.Delete(stopFlag); } catch { } return; }
+        lock (StopLock)
+        {
+            Playing = true; StopRequested = false; StopEvent.Reset();
+            if (StaleStopFlag) { StaleStopFlag = false; try { File.Delete(stopFlag); } catch { } }
+        }
+    }
+    static void EndPlayback() { if (WatchActive) lock (StopLock) { Playing = false; } }
+    static bool StopPending(string stopFlag) { return WatchActive ? StopRequested : File.Exists(stopFlag); }
+    static void ConsumeStop(string stopFlag)
+    {
+        if (WatchActive) { StopRequested = false; StopEvent.Reset(); }
+        else { try { File.Delete(stopFlag); } catch { } }
+    }
+
     static void HandleConnection(Stream conn)
     {
         string mode = null, raw = null;
@@ -271,7 +383,7 @@ static class TtsHook
             }
             if (mode == "quit") { Log("tts-hook.log", "player quit"); Environment.Exit(0); }
             if (mode != "speak" && mode != "stop" && mode != "elicit") return;
-            if (File.Exists(P("tts-muted.flag"))) return;
+            if (WatchActive ? Muted : File.Exists(P("tts-muted.flag"))) return;
             Run(mode, raw, false, true);
         }
         catch (Exception ex)
@@ -420,7 +532,7 @@ static class TtsHook
         List<string> result = new List<string>();
         if (string.IsNullOrEmpty(path) || !File.Exists(path)) return result;
         const long cap = 64L * 1024 * 1024;
-        const int block = 1 << 20;
+        const int block = 1 << 16;
         using (FileStream fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete))
         {
             long pos = fs.Length, total = 0; int newlines = 0;
@@ -455,30 +567,80 @@ static class TtsHook
     static Regex _skillTool;
     static Regex SkillTool { get { if (_skillTool == null) _skillTool = new Regex("\"name\"\\s*:\\s*\"Skill\""); return _skillTool; } }
 
-    // Newest Skill tool_use in the last 400 transcript lines (same window as the PowerShell version).
-    static string LastSkill(string transcript)
+    const int SkillWindowLines = 400;
+
+    // Skill name of one transcript line if it holds a Skill tool_use, else null.
+    static string SkillFromLine(string line)
     {
+        if (!SkillTool.IsMatch(line)) return null;                // cheap text filter before any JSON parse
+        object entry; try { entry = Json.DeserializeObject(line); } catch { return null; }
+        object content = Get(Get(entry, "message"), "content");
+        object[] items = content as object[];
+        if (items == null) return null;
+        foreach (object item in items)
+            if (Str(Get(item, "type")) == "tool_use" && Str(Get(item, "name")) == "Skill")
+            {
+                string s = Str(Get(Get(item, "input"), "skill"));
+                if (!string.IsNullOrEmpty(s)) return s;
+            }
+        return null;
+    }
+
+    // Newest Skill tool_use in the last 400 transcript lines (same window as the PowerShell version).
+    // since = number of lines after it.
+    static string FindSkill(List<string> lines, out int since)
+    {
+        since = SkillWindowLines;
         try
         {
-            List<string> lines = TailLines(transcript, 400);
             for (int i = lines.Count - 1; i >= 0; i--)
             {
-                if (!SkillTool.IsMatch(lines[i])) continue;       // cheap text filter before any JSON parse
-                object entry; try { entry = Json.DeserializeObject(lines[i]); } catch { continue; }
-                object content = Get(Get(entry, "message"), "content");
-                object[] items = content as object[];
-                if (items == null) continue;
-                foreach (object item in items)
-                    if (Str(Get(item, "type")) == "tool_use" && Str(Get(item, "name")) == "Skill")
-                    {
-                        string s = Str(Get(Get(item, "input"), "skill"));
-                        if (!string.IsNullOrEmpty(s)) return s;
-                    }
+                string sk = SkillFromLine(lines[i]);
+                if (sk != null) { since = lines.Count - 1 - i; return sk; }
             }
         }
         catch { }
-        Stage("skill");
         return null;
+    }
+
+    // Scans the transcript backwards in 128 KB blocks, newest line first, and stops at the first Skill tool_use or
+    // after 400 lines, so a recently used skill costs one small read instead of reading the whole 400-line window.
+    static string LastSkill(string transcript)
+    {
+        string found = null;
+        try
+        {
+            if (!string.IsNullOrEmpty(transcript) && File.Exists(transcript))
+                using (FileStream fs = new FileStream(transcript, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete))
+                {
+                    long pos = fs.Length; int seen = 0; byte[] carry = new byte[0];
+                    while (pos > 0 && seen < SkillWindowLines && found == null)
+                    {
+                        int take = (int)Math.Min(131072, pos);
+                        pos -= take;
+                        byte[] buf = new byte[take + carry.Length];
+                        fs.Seek(pos, SeekOrigin.Begin);
+                        int got = 0; while (got < take) { int r = fs.Read(buf, got, take - got); if (r <= 0) break; got += r; }
+                        Buffer.BlockCopy(carry, 0, buf, take, carry.Length);
+                        int first = 0;                                   // text before the first newline is a partial line
+                        if (pos > 0) { first = Array.IndexOf(buf, (byte)10); if (first < 0) { carry = buf; continue; } first++; }
+                        carry = new byte[first];
+                        Buffer.BlockCopy(buf, 0, carry, 0, first);
+                        string[] lines = Encoding.UTF8.GetString(buf, first, buf.Length - first).Split('\n');
+                        for (int i = lines.Length - 1; i >= 0 && seen < SkillWindowLines && found == null; i--)
+                        {
+                            string line = lines[i].TrimEnd('\r');
+                            if (line.Length == 0) continue;
+                            seen++;
+                            found = SkillFromLine(line);
+                        }
+                        if (pos == 0) break;
+                    }
+                }
+        }
+        catch { }
+        Stage("skill");
+        return found;
     }
 
     static bool RecentCron(string transcript)
@@ -507,35 +669,107 @@ static class TtsHook
     }
 
     // Session's friendly name. always=false: only a deliberate user rename (nameSource == "user").
+    // In the player the session files are parsed once and cached per file; the sessions watcher drops a file's
+    // entry when that file changes (Claude Code rewrites it on every status change), so a lookup re-reads at
+    // most the files that changed, and nothing at all when nothing changed.
+    class SessInfo { public string Id, Name, Source; }
+    static readonly Dictionary<string, SessInfo> SessByFile = new Dictionary<string, SessInfo>(StringComparer.OrdinalIgnoreCase);
+    static readonly HashSet<string> SessMissingIds = new HashSet<string>();     // ids with no session file, until the dir changes
+    static readonly object SessLock = new object();
+
+    static void SessionsChanged(string path)
+    {
+        lock (SessLock)
+        {
+            if (path == null) SessByFile.Clear(); else SessByFile.Remove(path);
+            SessMissingIds.Clear();
+        }
+    }
+
     static string SessionName(string transcript, bool always)
     {
         try
         {
             if (string.IsNullOrEmpty(transcript)) return null;
             string id = Path.GetFileNameWithoutExtension(transcript);
+            if (WatchActive)
+            {
+                lock (SessLock)
+                {
+                    SessInfo hit = FindSession(id);
+                    if (hit == null && !SessMissingIds.Contains(id))
+                    {
+                        string sd = P("sessions");
+                        if (Directory.Exists(sd))
+                            foreach (string f in Directory.GetFiles(sd, "*.json"))
+                            {
+                                if (SessByFile.ContainsKey(f)) continue;
+                                SessInfo si = new SessInfo();
+                                try
+                                {
+                                    object info = Json.DeserializeObject(File.ReadAllText(f));
+                                    si.Id = Str(Get(info, "sessionId")); si.Name = Str(Get(info, "name")); si.Source = Str(Get(info, "nameSource"));
+                                }
+                                catch { }
+                                SessByFile[f] = si;
+                            }
+                        hit = FindSession(id);
+                        if (hit == null) SessMissingIds.Add(id);
+                    }
+                    return PickName(hit, always);
+                }
+            }
             string sdir = P("sessions");
             if (!Directory.Exists(sdir)) return null;
             foreach (string f in Directory.GetFiles(sdir, "*.json"))
             {
                 object info; try { info = Json.DeserializeObject(File.ReadAllText(f)); } catch { continue; }
                 if (Str(Get(info, "sessionId")) != id) continue;
-                string name = Str(Get(info, "name"));
-                if (string.IsNullOrEmpty(name)) return null;
-                if (always || Str(Get(info, "nameSource")) == "user") return name;
-                return null;
+                SessInfo si = new SessInfo(); si.Name = Str(Get(info, "name")); si.Source = Str(Get(info, "nameSource"));
+                return PickName(si, always);
             }
         }
         catch { }
         return null;
     }
+    static SessInfo FindSession(string id)                           // call inside lock (SessLock)
+    {
+        foreach (SessInfo si in SessByFile.Values) if (si.Id == id) return si;
+        return null;
+    }
+    static string PickName(SessInfo si, bool always)
+    {
+        if (si == null || string.IsNullOrEmpty(si.Name)) return null;
+        if (always || si.Source == "user") return si.Name;
+        return null;
+    }
 
     // ---- config + cache ----------------------------------------------------------------------
+    // tts-config.json is parsed once and kept; the player reloads it when the watcher reports a change.
+    static Dictionary<string, object> _cfg;
+    static readonly object CfgLock = new object();
+    static Dictionary<string, object> Cfg()
+    {
+        Dictionary<string, object> c = _cfg;
+        if (c != null) return c;
+        lock (CfgLock) { if (_cfg == null) { _cfg = LoadCfgFile() ?? new Dictionary<string, object>(); } return _cfg; }
+    }
+    static Dictionary<string, object> LoadCfgFile()
+    {
+        try { return Json.DeserializeObject(File.ReadAllText(P("tts-config.json"))) as Dictionary<string, object>; }
+        catch { return null; }
+    }
+    static void ReloadCfg()
+    {
+        Dictionary<string, object> n = LoadCfgFile();
+        if (n == null && !File.Exists(P("tts-config.json"))) n = new Dictionary<string, object>();   // removed: defaults
+        if (n != null) lock (CfgLock) { _cfg = n; }                                                  // unreadable (mid-write): keep the old one
+    }
     static double? ConfigSpeed()
     {
         try
         {
-            object cfg = Json.DeserializeObject(File.ReadAllText(P("tts-config.json")));
-            object s = Get(cfg, "speed");
+            object s = Get(Cfg(), "speed");
             if (s != null) { double v = Convert.ToDouble(s); if (v >= 0.5 && v <= 1.5 && Math.Abs(v - 1.0) > 1e-9) return v; }
         }
         catch { }
@@ -543,7 +777,7 @@ static class TtsHook
     }
     static int ConfigInt(string key, int dflt)
     {
-        try { object v = Get(Json.DeserializeObject(File.ReadAllText(P("tts-config.json"))), key); if (v != null) return Convert.ToInt32(v); }
+        try { object v = Get(Cfg(), key); if (v != null) return Convert.ToInt32(v); }
         catch { }
         return dflt;
     }
@@ -563,14 +797,10 @@ static class TtsHook
         double? speed = ConfigSpeed();
         bool cacheable = text.Length <= ConfigInt("cacheMaxChars", 200);
         string cache = cacheable ? CachePath(text, gender, speed) : null;
-        if (cache != null && File.Exists(cache))
+        if (cache != null)
         {
-            try
-            {
-                byte[] hit = File.ReadAllBytes(cache);
-                if (hit.Length > 44) { try { File.SetLastWriteTime(cache, DateTime.Now); } catch { } Stage("cachehit"); return hit; }
-            }
-            catch { }
+            byte[] hit = CacheGet(cache);
+            if (hit != null) { Stage("cachehit"); return hit; }
         }
 
         Dictionary<string, object> body = new Dictionary<string, object>();
@@ -596,24 +826,117 @@ static class TtsHook
         return wav;
     }
 
+    // ---- WAV cache: recent entries in memory, the list of files on disk in memory -------------------
+    // In the player a cache hit costs no file IO at all (a miss neither: the player knows what is on disk).
+    // A hit from disk is read once, then kept in memory. The file's timestamp (the LRU order for pruning) is
+    // refreshed on a disk hit and at most every 10 minutes for memory hits.
+    class MemEntry { public byte[] Wav; public DateTime LastUse, LastTouch; }
+    static readonly Dictionary<string, MemEntry> MemCache = new Dictionary<string, MemEntry>();
+    static HashSet<string> DiskIndex;                                // guarded by lock (MemCache)
+    static long MemBytes;
+    const int MemMaxEntries = 40;
+    const long MemMaxBytes = 32L * 1024 * 1024;
+    static bool _cacheDirReady;
+
+    static void EnsureDiskIndex()                                    // call inside lock (MemCache)
+    {
+        if (DiskIndex != null) return;
+        DiskIndex = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        try { foreach (string f in Directory.GetFiles(P("tts-cache"), "*.wav")) DiskIndex.Add(f); } catch { }
+    }
+
+    static byte[] CacheGet(string cache)
+    {
+        if (!WatchActive)                                            // one-shot worker: plain file access
+        {
+            if (!File.Exists(cache)) return null;
+            try
+            {
+                byte[] h = File.ReadAllBytes(cache);
+                if (h.Length > 44) { try { File.SetLastWriteTime(cache, DateTime.Now); } catch { } return h; }
+            }
+            catch { }
+            return null;
+        }
+        DateTime now = DateTime.UtcNow; byte[] wav = null; bool touch = false;
+        lock (MemCache)
+        {
+            MemEntry e;
+            if (MemCache.TryGetValue(cache, out e))
+            {
+                e.LastUse = now; wav = e.Wav;
+                if ((now - e.LastTouch).TotalMinutes > 10) { e.LastTouch = now; touch = true; }
+            }
+            else
+            {
+                EnsureDiskIndex();
+                if (!DiskIndex.Contains(cache)) return null;
+            }
+        }
+        if (wav != null)
+        {
+            if (touch) { try { File.SetLastWriteTime(cache, DateTime.Now); } catch { } }
+            return wav;
+        }
+        try
+        {
+            byte[] h = File.ReadAllBytes(cache);
+            if (h.Length > 44)
+            {
+                try { File.SetLastWriteTime(cache, DateTime.Now); } catch { }
+                MemPut(cache, h, now);
+                return h;
+            }
+        }
+        catch { lock (MemCache) { DiskIndex.Remove(cache); } }
+        return null;
+    }
+
+    static void MemPut(string cache, byte[] wav, DateTime now)
+    {
+        lock (MemCache)
+        {
+            MemEntry old;
+            if (MemCache.TryGetValue(cache, out old)) MemBytes -= old.Wav.Length;
+            MemEntry e = new MemEntry(); e.Wav = wav; e.LastUse = now; e.LastTouch = now;
+            MemCache[cache] = e; MemBytes += wav.Length;
+            while ((MemCache.Count > MemMaxEntries || MemBytes > MemMaxBytes) && MemCache.Count > 1)
+            {
+                string oldest = null; DateTime ot = DateTime.MaxValue;
+                foreach (KeyValuePair<string, MemEntry> kv in MemCache)
+                    if (kv.Key != cache && kv.Value.LastUse < ot) { ot = kv.Value.LastUse; oldest = kv.Key; }
+                if (oldest == null) break;
+                MemBytes -= MemCache[oldest].Wav.Length; MemCache.Remove(oldest);
+            }
+        }
+    }
+
     static void SaveCache(string cache, byte[] wav)
     {
         if (wav.Length <= 44) return;
         try
         {
-            Directory.CreateDirectory(P("tts-cache"));
+            if (WatchActive) MemPut(cache, wav, DateTime.UtcNow);
+            if (!_cacheDirReady) { Directory.CreateDirectory(P("tts-cache")); _cacheDirReady = true; }
             string tmp = cache + "." + Process.GetCurrentProcess().Id + "." + Thread.CurrentThread.ManagedThreadId + ".tmp";
             File.WriteAllBytes(tmp, wav);
-            if (File.Exists(cache)) File.Delete(cache);
-            File.Move(tmp, cache);
-            Prune(ConfigInt("cacheMaxFiles", 300));
+            try { File.Move(tmp, cache); }
+            catch (IOException) { File.Delete(cache); File.Move(tmp, cache); }      // already there (rare): replace
+            int max = ConfigInt("cacheMaxFiles", 300);
+            if (WatchActive)
+            {
+                bool prune;
+                lock (MemCache) { EnsureDiskIndex(); DiskIndex.Add(cache); prune = DiskIndex.Count > max; }
+                if (prune) Prune(max);                                              // only when over the limit, not on every save
+            }
+            else Prune(max);
         }
         catch { }
     }
 
     static bool ConfigBool(string key, bool dflt)
     {
-        try { object v = Get(Json.DeserializeObject(File.ReadAllText(P("tts-config.json"))), key); if (v != null) return Convert.ToBoolean(v); }
+        try { object v = Get(Cfg(), key); if (v != null) return Convert.ToBoolean(v); }
         catch { }
         return dflt;
     }
@@ -629,20 +952,15 @@ static class TtsHook
         string cache = cacheable ? CachePath(msg, gender, speed) : null;
         PlayItem it = new PlayItem(); it.High = high; it.Mode = mode; it.Chars = msg.Length;
 
-        if (cache != null && File.Exists(cache))
+        if (cache != null)
         {
-            try
+            byte[] hit = CacheGet(cache);
+            if (hit != null)
             {
-                byte[] hit = File.ReadAllBytes(cache);
-                if (hit.Length > 44)
-                {
-                    try { File.SetLastWriteTime(cache, DateTime.Now); } catch { }
-                    Stage("cachehit");
-                    it.Add(hit); it.Finish(); it.Stages = Stages; it.Enqueued = DateTime.UtcNow; EnqueuePlay(it);
-                    return;
-                }
+                Stage("cachehit");
+                it.Add(hit); it.Finish(); it.Stages = Stages; it.Enqueued = DateTime.UtcNow; EnqueuePlay(it);
+                return;
             }
-            catch { }
         }
 
         if (ConfigBool("streaming", true) && TryStream(msg, gender, speed, it, cache)) return;
@@ -734,12 +1052,19 @@ static class TtsHook
         return o.ToArray();
     }
 
+    // Deletes the oldest WAVs. In the player it prunes down to max - 10 so the next saves do not list the
+    // directory again straight away.
     static void Prune(int max)
     {
         FileInfo[] files = new DirectoryInfo(P("tts-cache")).GetFiles("*.wav");
         if (files.Length <= max) return;
+        int keep = WatchActive ? Math.Max(1, max - 10) : max;
         Array.Sort(files, delegate (FileInfo a, FileInfo b) { return a.LastWriteTimeUtc.CompareTo(b.LastWriteTimeUtc); });
-        for (int i = 0; i < files.Length - max; i++) try { files[i].Delete(); } catch { }
+        for (int i = 0; i < files.Length - keep; i++)
+        {
+            try { files[i].Delete(); } catch { continue; }
+            if (WatchActive) lock (MemCache) { if (DiskIndex != null) DiskIndex.Remove(files[i].FullName); }
+        }
     }
 
     // ---- playback (same sequencing as tts-client.ps1) ----------------------------------------
@@ -776,7 +1101,7 @@ static class TtsHook
             if (!acquired) { Log("tts-client-errors.log", "mutex timeout after " + mutexWaitSec + "s (another speak in progress)"); return false; }
 
             if (recordPid) File.WriteAllText(P("audio.pids"), Process.GetCurrentProcess().Id.ToString());
-            try { File.Delete(stopFlag); } catch { }
+            BeginPlayback(stopFlag);
 
             Stopwatch clock = null;
             double prevStart = 0, prevDur = 0;
@@ -810,7 +1135,7 @@ static class TtsHook
                 {
                     next = it.Wait(i, 50);
                     if (next != null || it.Done || it.Cancelled) break;
-                    if (File.Exists(stopFlag)) { p.Stop(); try { File.Delete(stopFlag); } catch { } stopped = true; }
+                    if (StopPending(stopFlag)) { p.Stop(); ConsumeStop(stopFlag); stopped = true; }
                 }
                 if (stopped) { it.Cancelled = true; return true; }
                 if (next == null)                                  // no more chunks: let the last one play out
@@ -834,20 +1159,24 @@ static class TtsHook
         {
             if (cur != null) { try { cur.Dispose(); } catch { } }
             if (curStream != null) { try { curStream.Dispose(); } catch { } }
+            EndPlayback();
             if (acquired) { try { mutex.ReleaseMutex(); } catch { } }
             mutex.Dispose();
         }
     }
 
-    // Polls the stop flag while waiting for t seconds on the clock. True = stop requested (and honoured).
+    // Waits for t seconds on the clock, watching for a stop (event in the player, file polling in a one-shot
+    // worker). True = stop requested (and honoured).
     static bool WaitUntil(Stopwatch clock, double t, string stopFlag, SoundPlayer p)
     {
-        while (clock.Elapsed.TotalSeconds < t)
+        while (true)
         {
-            if (File.Exists(stopFlag)) { p.Stop(); try { File.Delete(stopFlag); } catch { } return true; }
-            Thread.Sleep(15);
+            if (StopPending(stopFlag)) { p.Stop(); ConsumeStop(stopFlag); return true; }
+            double left = t - clock.Elapsed.TotalSeconds;
+            if (left <= 0) return false;
+            if (WatchActive) StopEvent.WaitOne((int)Math.Ceiling(left * 1000));    // wakes when a stop arrives, no polling
+            else Thread.Sleep(15);
         }
-        return false;
     }
 
     static bool PlayLocked(byte[] wav, bool recordPid, int mutexWaitSec)
@@ -961,13 +1290,28 @@ static class TtsHook
     }
 
     // ---- logging -----------------------------------------------------------------------------
+    static long _hookLogBytes = -1;
+    static readonly object LogLock = new object();
     static void Log(string file, string line)
     {
         try
         {
             string path = P(file);
-            if (file == "tts-hook.log" && File.Exists(path) && new FileInfo(path).Length > 200 * 1024) File.Delete(path);
-            File.AppendAllText(path, DateTime.Now.ToString("o") + " " + line + Environment.NewLine);
+            string text = DateTime.Now.ToString("o") + " " + line + Environment.NewLine;
+            if (file == "tts-hook.log")
+            {
+                // size counted in memory (one stat the first time) instead of a stat per line; other writers
+                // (tts-send's SLOW lines) make it slightly low, which only delays the trim a little
+                lock (LogLock)
+                {
+                    if (_hookLogBytes < 0) { try { _hookLogBytes = File.Exists(path) ? new FileInfo(path).Length : 0; } catch { _hookLogBytes = 0; } }
+                    if (_hookLogBytes > 200 * 1024) { File.Delete(path); _hookLogBytes = 0; }
+                    File.AppendAllText(path, text);
+                    _hookLogBytes += text.Length;
+                }
+                return;
+            }
+            File.AppendAllText(path, text);
         }
         catch { }
     }

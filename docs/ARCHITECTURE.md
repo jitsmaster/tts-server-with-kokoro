@@ -21,7 +21,7 @@ tts-hook.exe --daemon  (the resident player; starts itself on demand, one instan
    v
 playback thread: questions first, then FIFO; one machine-wide mutex; phrases handed over 0.15 s early
    v
-System.Media.SoundPlayer  ->  speakers          (stop: tts-stop.flag, polled every 15-50 ms)
+System.Media.SoundPlayer  ->  speakers          (stop: tts-stop.flag, seen by a file watcher; wakes the wait at once)
 
 Kokoro TTS server (FastAPI, GPU)  <-  /tts (whole WAV)   /tts/stream (phrase by phrase)
    English: pipeline 'b' (British), voices bm_daniel / bf_isabella         v1.0 weights
@@ -92,6 +92,23 @@ Kokoro TTS server (FastAPI, GPU)  <-  /tts (whole WAV)   /tts/stream (phrase by 
 - **Cache.** Texts up to 200 characters are cached as one WAV in `.claude\tts-cache\` (key = SHA1 of gender, speed
   and text; at most 300 files, oldest removed). A streamed short message is reassembled and cached when the stream
   ended cleanly. The key does not include the model or voice: clear the folder after changing either.
+- **Little IO (resident player only; one-shot workers keep the plain file reads).** Everything the player used to
+  re-read per message is kept in memory and refreshed by watchers:
+  - a `FileSystemWatcher` on `.claude\tts-*` (config, mute flag, stop flag) and `.claude\sessions\*.json`. The config
+    is parsed once and reloaded 150 ms after a change (an unreadable file keeps the old config); `Muted` and
+    `StopRequested` are in-memory flags; a stop wakes the playback wait through a `ManualResetEvent` (no 15 ms
+    `File.Exists` polling); the stop-flag delete is retried 8 x 25 ms. If the watchers cannot start the log line says
+    `(no file watchers: polling)` and the old file checks are used.
+  - a WAV cache in memory (40 entries / 32 MB) and an in-memory index of the `tts-cache` files, so a hit or miss
+    does no `File.Exists`/read; the LRU timestamp is touched at most every 10 min; pruning happens only when over
+    `cacheMaxFiles` (down to max - 10).
+  - the session name per session file (invalidated by the sessions watcher, plus a negative cache for unknown ids).
+  - the log size is counted in memory (no `File.Exists` + `FileInfo` per line).
+  - the skill lookup scans the transcript **backwards** in 128 KB blocks and stops at the first `Skill` tool_use
+    (window still 400 lines); `TailLines` reads 64 KB blocks instead of 1 MB.
+  Measured with 10 `stop` messages against a 14 MB transcript: old player 21.4 MB read in 153 read operations; new
+  player 13.1 MB in 108 (the remainder is that backward scan when no skill is found in the window; the player
+  process's other IO per message is ~0).
 - **Fallbacks.** Streaming unavailable (old server, `"streaming": false`) -> whole-message `/tts`. Stream cut after
   the first phrase -> what arrived is played and the log line carries `note=stream-cut`.
 
@@ -136,6 +153,17 @@ listening) is enabled.
 Tests: `.\.venv\Scripts\python.exe -m pytest -q` (35 pass).
 
 ## Gotchas
+
+- **Keep the single-instance mutex in a static field.** The mutex `Global\TtsHookDaemon` was a local variable that is
+  never read after creation; the optimised build lets the GC collect it, the name disappears, `tts-send` sees "no
+  player" and starts a second player (several pile up). It is `static Mutex SingleInstance` now.
+- **Sophos Intercept X (Generic ML PUA).** Freshly compiled throwaway exes in `%TEMP%` were flagged and made unreadable
+  (27 of them, 2026-10-13 12:47-12:57; the deployed `.claude` exes never were). The score is per build, close to a
+  threshold, not tied to one construct (builds with an incremental per-transcript cursor failed, even stubbed). After
+  every compile check `[IO.File]::ReadAllBytes` works before deploying; if denied, do not deploy, trim or retry. Delete
+  test builds afterwards. If the deployed exe is ever flagged, ask for an exclusion for `.claude\tts-hook.exe`.
+- **Testing from a sandboxed shell.** `$json | tts-send.exe` from PowerShell can deliver stdin 5-25 s late; use
+  `cmd /c "tts-send.exe speak < file.json"`.
 
 - **The server cannot cancel a request.** A 224,000-character test text wedged it (the client timed out at 30 s, the
   server kept synthesizing); recovery was killing uvicorn and restarting. Streaming limits the damage of long texts
