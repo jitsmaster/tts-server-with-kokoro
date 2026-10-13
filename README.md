@@ -81,4 +81,14 @@ Two more optional fields: `speed` (0.5 to 1.5, default 1.0) sets the speaking ra
 | Language | Male | Female |
 |---|---|---|
 | English | bm_daniel | bf_isabella |
-| Chinese | zm_yunjian | zf_xiaobei |
+| Chinese (own model, Kokoro-82M-v1.1-zh) | zm_010 | zf_001 |
+
+## Chinese model and language routing
+
+- Text containing **any** Chinese character (CJK ideograph) is spoken entirely by the Chinese model, `hexgrad/Kokoro-82M-v1.1-zh` (downloaded once to the Hugging Face cache, ~330 MB). Latin words inside such text are phonemized by misaki's English G2P (no English TTS model) and spoken by the Chinese voice, so they are not dropped. Text with no Chinese goes to the English pipeline.
+- Chinese voices are the v1.1-zh ones (`zm_010` male, `zf_001` female); change them in `app/voices.py` (the repo lists ~100, e.g. `zf_002`...`zm_045`).
+- If the Chinese model cannot be loaded at startup (e.g. first run offline) the server logs it, English keeps working, and the next Chinese request retries.
+
+## Streaming endpoint and architecture
+
+`POST /tts/stream` takes the same body as `/tts` and returns `application/x-wav-frames`: repeated `[uint32 LE length][WAV]`, one WAV per phrase, ended by a zero length, so a player can start after the first phrase. The whole voice pipeline (native hook client, resident player, queue, cache, stop hotkey, Chinese model) is described in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
